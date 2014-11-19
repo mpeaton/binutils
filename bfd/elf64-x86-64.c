@@ -760,6 +760,10 @@ struct elf_x86_64_link_hash_entry
   /* TRUE if symbol has at least one BND relocation.  */
   bfd_boolean has_bnd_reloc;
 
+  /* Information about the GOT PLT entry. Filled when there are both
+     GOT and PLT relocations against the same function.  */
+  union gotplt_union plt_got;
+
   /* Information about the second PLT entry. Filled when has_bnd_reloc is
      set.  */
   union gotplt_union plt_bnd;
@@ -815,6 +819,7 @@ struct elf_x86_64_link_hash_table
   asection *srelbss;
   asection *plt_eh_frame;
   asection *plt_bnd;
+  asection *plt_got;
 
   union
   {
@@ -894,6 +899,7 @@ elf_x86_64_link_hash_newfunc (struct bfd_hash_entry *entry,
       eh->tls_type = GOT_UNKNOWN;
       eh->has_bnd_reloc = FALSE;
       eh->plt_bnd.offset = (bfd_vma) -1;
+      eh->plt_got.offset = (bfd_vma) -1;
       eh->tlsdesc_got = (bfd_vma) -1;
     }
 
@@ -2046,6 +2052,46 @@ do_size:
 	default:
 	  break;
 	}
+
+      if (h != NULL
+	  && h->plt.refcount > 0
+	  && h->got.refcount > 0
+	  && htab->plt_got == NULL)
+	{
+	  /* Create the procedure linkage table against the regular
+	     GOT slot.  */
+	  unsigned int plt_got_align;
+	  const struct elf_backend_data *bed;
+
+	  bed = get_elf_backend_data (info->output_bfd);
+	  switch (sizeof (elf_x86_64_legacy_plt2_entry))
+	    {
+	    case 8:
+	      plt_got_align = 3;
+	      break;
+	    case 16:
+	      plt_got_align = 4;
+	      break;
+	    default:
+	      abort ();
+	    }
+
+	  if (htab->elf.dynobj == NULL)
+	    htab->elf.dynobj = abfd;
+	  htab->plt_got
+	    = bfd_make_section_anyway_with_flags (htab->elf.dynobj,
+						  ".plt.got",
+						  (bed->dynamic_sec_flags
+						   | SEC_ALLOC
+						   | SEC_CODE
+						   | SEC_LOAD
+						   | SEC_READONLY));
+	  if (htab->plt_got == NULL
+	      || !bfd_set_section_alignment (htab->elf.dynobj,
+					     htab->plt_got,
+					     plt_got_align))
+	    return FALSE;
+	}
     }
 
   return TRUE;
@@ -3131,6 +3177,7 @@ elf_x86_64_size_dynamic_sections (bfd *output_bfd,
 	  || s == htab->elf.iplt
 	  || s == htab->elf.igotplt
 	  || s == htab->plt_bnd
+	  || s == htab->plt_got
 	  || s == htab->plt_eh_frame
 	  || s == htab->sdynbss)
 	{
