@@ -968,6 +968,7 @@ elf_x86_64_get_local_sym_hash (struct elf_x86_64_link_hash_table *htab,
       ret->elf.indx = sec->id;
       ret->elf.dynstr_index = htab->r_sym (rel->r_info);
       ret->elf.dynindx = -1;
+      ret->plt_got.offset = (bfd_vma) -1;
       *slot = ret;
     }
   return &ret->elf;
@@ -2468,6 +2469,18 @@ elf_x86_64_allocate_dynrelocs (struct elf_link_hash_entry *h, void * inf)
   bed = get_elf_backend_data (info->output_bfd);
   plt_entry_size = GET_PLT_ENTRY_SIZE (info->output_bfd);
 
+  if (h->type != STT_GNU_IFUNC
+      && h->plt.refcount > 0
+      && h->got.refcount > 0)
+    {
+      /* Don't use the regular PLT if there are both GOT and GOTPLT
+         reloctions.  */
+      h->plt.offset = (bfd_vma) -1;
+
+      /* Use the GOT PLT.  */
+      eh->plt_got.refcount = 1;
+    }
+
   /* Since STT_GNU_IFUNC symbol must go through PLT, we handle it
      here if it is defined and referenced in a non-shared object.  */
   if (h->type == STT_GNU_IFUNC
@@ -2495,8 +2508,10 @@ elf_x86_64_allocate_dynrelocs (struct elf_link_hash_entry *h, void * inf)
 	return FALSE;
     }
   else if (htab->elf.dynamic_sections_created
-	   && h->plt.refcount > 0)
+	   && (h->plt.refcount > 0 || eh->plt_got.refcount > 0))
     {
+      bfd_boolean use_plt_got = eh->plt_got.refcount > 0;
+
       /* Make sure this symbol is output as a dynamic symbol.
 	 Undefined weak syms won't yet be marked as dynamic.  */
       if (h->dynindx == -1
@@ -2511,15 +2526,24 @@ elf_x86_64_allocate_dynrelocs (struct elf_link_hash_entry *h, void * inf)
 	{
 	  asection *s = htab->elf.splt;
 	  asection *bnd_s = htab->plt_bnd;
+	  asection *got_s = htab->plt_got;
 
 	  /* If this is the first .plt entry, make room for the special
 	     first entry.  */
 	  if (s->size == 0)
 	    s->size = plt_entry_size;
 
-	  h->plt.offset = s->size;
-	  if (bnd_s)
-	    eh->plt_bnd.offset = bnd_s->size;
+	  if (use_plt_got)
+	    {
+	      BFD_ASSERT (got_s != NULL);
+	      eh->plt_got.offset = got_s->size;
+	    }
+	  else
+	    {
+	      h->plt.offset = s->size;
+	      if (bnd_s)
+		eh->plt_bnd.offset = bnd_s->size;
+	    }
 
 	  /* If this symbol is not defined in a regular file, and we are
 	     not generating a shared library, then set the symbol to this
@@ -2529,36 +2553,51 @@ elf_x86_64_allocate_dynrelocs (struct elf_link_hash_entry *h, void * inf)
 	  if (! info->shared
 	      && !h->def_regular)
 	    {
-	      if (bnd_s)
+	      if (use_plt_got)
 		{
-		  /* We need to make a call to the entry of the second
-		     PLT instead of regular PLT entry.  */
-		  h->root.u.def.section = bnd_s;
-		  h->root.u.def.value = eh->plt_bnd.offset;
+		  /* We need to make a call to the entry of the GOT PLT
+		     instead of regular PLT entry.  */
+		  h->root.u.def.section = got_s;
+		  h->root.u.def.value = eh->plt_got.offset;
 		}
 	      else
 		{
-		  h->root.u.def.section = s;
-		  h->root.u.def.value = h->plt.offset;
+		  if (bnd_s)
+		    {
+		      /* We need to make a call to the entry of the second
+			 PLT instead of regular PLT entry.  */
+		      h->root.u.def.section = bnd_s;
+		      h->root.u.def.value = eh->plt_bnd.offset;
+		    }
+		  else
+		    {
+		      h->root.u.def.section = s;
+		      h->root.u.def.value = h->plt.offset;
+		    }
 		}
 	    }
 
 	  /* Make room for this entry.  */
-	  s->size += plt_entry_size;
-	  if (bnd_s)
+	  BFD_ASSERT (sizeof (elf_x86_64_bnd_plt2_entry)
+		      == sizeof (elf_x86_64_legacy_plt2_entry));
+	  if (use_plt_got)
+	    got_s->size += sizeof (elf_x86_64_legacy_plt2_entry);
+	  else
 	    {
-	      BFD_ASSERT (sizeof (elf_x86_64_bnd_plt2_entry)
-			  == sizeof (elf_x86_64_legacy_plt2_entry));
-	      bnd_s->size += sizeof (elf_x86_64_legacy_plt2_entry);
+	      s->size += plt_entry_size;
+	      if (bnd_s)
+		bnd_s->size += sizeof (elf_x86_64_legacy_plt2_entry);
+
+	      /* We also need to make an entry in the .got.plt section,
+		 which will be placed in the .got section by the linker
+		 script.  */
+	      htab->elf.sgotplt->size += GOT_ENTRY_SIZE;
+
+	      /* We also need to make an entry in the .rela.plt
+		 section.  */
+	      htab->elf.srelplt->size += bed->s->sizeof_rela;
+	      htab->elf.srelplt->reloc_count++;
 	    }
-
-	  /* We also need to make an entry in the .got.plt section, which
-	     will be placed in the .got section by the linker script.  */
-	  htab->elf.sgotplt->size += GOT_ENTRY_SIZE;
-
-	  /* We also need to make an entry in the .rela.plt section.  */
-	  htab->elf.srelplt->size += bed->s->sizeof_rela;
-	  htab->elf.srelplt->reloc_count++;
 	}
       else
 	{
@@ -3943,7 +3982,8 @@ elf_x86_64_relocate_section (bfd *output_bfd,
 	  if (h == NULL)
 	    break;
 
-	  if (h->plt.offset == (bfd_vma) -1
+	  if ((h->plt.offset == (bfd_vma) -1
+	       && eh->plt_got.offset == (bfd_vma) -1)
 	      || htab->elf.splt == NULL)
 	    {
 	      /* We didn't make a PLT entry for this symbol.  This
@@ -3952,15 +3992,25 @@ elf_x86_64_relocate_section (bfd *output_bfd,
 	      break;
 	    }
 
-	  if (htab->plt_bnd != NULL)
+	  if (h->plt.offset != (bfd_vma) -1)
 	    {
-	      resolved_plt = htab->plt_bnd;
-	      plt_offset = eh->plt_bnd.offset;
+	      if (htab->plt_bnd != NULL)
+		{
+		  resolved_plt = htab->plt_bnd;
+		  plt_offset = eh->plt_bnd.offset;
+		}
+	      else
+		{
+		  resolved_plt = htab->elf.splt;
+		  plt_offset = h->plt.offset;
+		}
 	    }
 	  else
 	    {
-	      resolved_plt = htab->elf.splt;
-	      plt_offset = h->plt.offset;
+	      /* Use the GOT PLT.  */
+	      BFD_ASSERT (htab->plt_got != NULL);
+	      resolved_plt = htab->plt_got;
+	      plt_offset = eh->plt_got.offset;
 	    }
 
 	  relocation = (resolved_plt->output_section->vma
@@ -4775,6 +4825,7 @@ elf_x86_64_finish_dynamic_symbol (bfd *output_bfd,
   struct elf_x86_64_link_hash_table *htab;
   const struct elf_x86_64_backend_data *abed;
   bfd_boolean use_plt_bnd;
+  struct elf_x86_64_link_hash_entry *eh;
 
   htab = elf_x86_64_hash_table (info);
   if (htab == NULL)
@@ -4786,6 +4837,8 @@ elf_x86_64_finish_dynamic_symbol (bfd *output_bfd,
   abed = (use_plt_bnd
 	  ? &elf_x86_64_bnd_arch_bed
 	  : get_elf_x86_64_backend_data (output_bfd));
+
+  eh = (struct elf_x86_64_link_hash_entry *) h;
 
   if (h->plt.offset != (bfd_vma) -1)
     {
@@ -4855,8 +4908,6 @@ elf_x86_64_finish_dynamic_symbol (bfd *output_bfd,
 	{
 	  /* Use the second PLT with BND relocations.  */
 	  const bfd_byte *plt_entry, *plt2_entry;
-	  struct elf_x86_64_link_hash_entry *eh
-	    = (struct elf_x86_64_link_hash_entry *) h;
 
 	  if (eh->has_bnd_reloc)
 	    {
@@ -4968,21 +5019,83 @@ elf_x86_64_finish_dynamic_symbol (bfd *output_bfd,
       bed = get_elf_backend_data (output_bfd);
       loc = relplt->contents + plt_index * bed->s->sizeof_rela;
       bed->s->swap_reloca_out (output_bfd, &rela, loc);
+    }
+  else if (eh->plt_got.offset != (bfd_vma) -1)
+    {
+      bfd_vma got_offset, plt_offset, plt_got_offset, plt_got_insn_size;
+      asection *plt, *got;
+      bfd_boolean got_after_plt;
+      int32_t got_pcrel_offset;
+      const bfd_byte *got_plt_entry;
 
-      if (!h->def_regular)
+      /* Set the entry in the GOT procedure linkage table.  */
+      plt = htab->plt_got;
+      got = htab->elf.sgot;
+      got_offset = h->got.offset;
+
+      if (got_offset == (bfd_vma) -1
+	  || h->type == STT_GNU_IFUNC
+	  || plt == NULL
+	  || got == NULL)
+	abort ();
+
+      /* Use the second PLT entry template for the GOT PLT since they
+	 are the identical.  */
+      plt_got_insn_size = elf_x86_64_bnd_arch_bed.plt_got_insn_size;
+      plt_got_offset = elf_x86_64_bnd_arch_bed.plt_got_offset;
+      if (eh->has_bnd_reloc)
+	got_plt_entry = elf_x86_64_bnd_plt2_entry;
+      else
 	{
-	  /* Mark the symbol as undefined, rather than as defined in
-	     the .plt section.  Leave the value if there were any
-	     relocations where pointer equality matters (this is a clue
-	     for the dynamic linker, to make function pointer
-	     comparisons work between an application and shared
-	     library), otherwise set it to zero.  If a function is only
-	     called from a binary, there is no need to slow down
-	     shared libraries because of that.  */
-	  sym->st_shndx = SHN_UNDEF;
-	  if (!h->pointer_equality_needed)
-	    sym->st_value = 0;
+	  got_plt_entry = elf_x86_64_legacy_plt2_entry;
+
+	  /* Subtract 1 since there is no BND prefix.  */
+	  plt_got_insn_size -= 1;
+	  plt_got_offset -= 1;
 	}
+
+      /* Fill in the entry in the GOT procedure linkage table.  */
+      memcpy (plt->contents + eh->plt_got.offset,
+	      got_plt_entry, sizeof (elf_x86_64_legacy_plt2_entry));
+
+      plt_offset = eh->plt_got.offset;
+
+      /* Put offset the PC-relative instruction referring to the GOT
+	 entry, subtracting the size of that instruction.  */
+      got_pcrel_offset = (got->output_section->vma
+			  + got->output_offset
+			  + got_offset
+			  - plt->output_section->vma
+			  - plt->output_offset
+			  - plt_offset
+			  - plt_got_insn_size);
+
+      /* Check PC-relative offset overflow in GOT PLT entry.  */
+      got_after_plt = got->output_section->vma > plt->output_section->vma;
+      if ((got_after_plt && got_pcrel_offset < 0)
+	  || (!got_after_plt && got_pcrel_offset > 0))
+	info->callbacks->einfo (_("%F%B: PC-relative offset overflow in GOT PLT entry for `%s'\n"),
+				output_bfd, h->root.root.string);
+
+      bfd_put_32 (output_bfd, got_pcrel_offset,
+		  plt->contents + plt_offset + plt_got_offset);
+    }
+
+  if (!h->def_regular
+      && (h->plt.offset != (bfd_vma) -1
+	  || eh->plt_got.offset != (bfd_vma) -1))
+    {
+      /* Mark the symbol as undefined, rather than as defined in
+	 the .plt section.  Leave the value if there were any
+	 relocations where pointer equality matters (this is a clue
+	 for the dynamic linker, to make function pointer
+	 comparisons work between an application and shared
+	 library), otherwise set it to zero.  If a function is only
+	 called from a binary, there is no need to slow down
+	 shared libraries because of that.  */
+      sym->st_shndx = SHN_UNDEF;
+      if (!h->pointer_equality_needed)
+	sym->st_value = 0;
     }
 
   if (h->got.offset != (bfd_vma) -1
