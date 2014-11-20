@@ -2469,7 +2469,11 @@ elf_x86_64_allocate_dynrelocs (struct elf_link_hash_entry *h, void * inf)
   bed = get_elf_backend_data (info->output_bfd);
   plt_entry_size = GET_PLT_ENTRY_SIZE (info->output_bfd);
 
+  /* We can't use the GOT PLT if there is non-GOT relocation since it
+     must go through the regular PLT to support IFUNC symbols defined
+     in shared objects.  */
   if (h->type != STT_GNU_IFUNC
+      && !h->non_got_ref
       && h->plt.refcount > 0
       && h->got.refcount > 0)
     {
